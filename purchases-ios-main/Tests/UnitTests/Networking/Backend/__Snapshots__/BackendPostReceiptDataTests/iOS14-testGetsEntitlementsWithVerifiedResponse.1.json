@@ -1,0 +1,24 @@
+{
+  "headers" : {
+    "Authorization" : "Bearer asharedsecret",
+    "X-Nonce" : "MTIzNDU2Nzg5MGFi",
+    "X-Post-Params-Hash" : "app_user_id,fetch_token:sha256:2cc3741ddb808ae6fd179f1398d9115b58772590765edf799ec778f929faa46d"
+  },
+  "request" : {
+    "body" : {
+      "app_user_id" : "user",
+      "attributes" : {
+        "$attConsentStatus" : {
+          "updated_at_ms" : 1678307200000,
+          "value" : "authorized"
+        }
+      },
+      "fetch_token" : "YW4gYXdlc29tZSByZWNlaXB0",
+      "initiation_source" : "purchase",
+      "is_restore" : false,
+      "observer_mode" : false
+    },
+    "method" : "POST",
+    "url" : "https://api.revenuecat.com/v1/receipts"
+  }
+}

@@ -1,0 +1,1041 @@
+orbs:
+  macos: circleci/macos@2.0.1
+  slack: circleci/slack@4.10.1
+  codecov: codecov/codecov@3.2.4
+
+version: 2.1
+
+parameters:
+  action:
+    type: enum
+    enum: [default, bump]
+    default: default
+  generate_snapshots:
+    default: false
+    type: boolean
+
+aliases:
+  base-job: &base-job
+    resource_class: macos.x86.medium.gen2
+    macos:
+      xcode: << parameters.xcode_version >>
+    parameters:
+      xcode_version:
+        type: string
+    environment:
+      CIRCLECI_TESTS_GENERATE_SNAPSHOTS: << pipeline.parameters.generate_snapshots >> 
+    working_directory: ~/purchases-ios
+    shell: /bin/bash --login -o pipefail
+  release-branches: &release-branches
+    filters:
+      tags:
+        ignore: /.*/
+      branches:
+        only: /^release\/.*/
+  release-tags: &release-tags
+    filters:
+      tags:
+        ignore: /^.*-SNAPSHOT/
+      branches:
+        ignore: /.*/
+  release-branches-and-main: &release-branches-and-main
+    filters:
+      tags:
+        ignore: /.*/
+      branches:
+        only:
+          - main
+          - /^release\/.*/
+  only-main-branch: &only-main-branch
+    filters:
+      tags:
+        ignore: /.*/
+      branches:
+        only: main
+  non-patch-release-branches: &non-patch-release-branches
+    filters: 
+      tags:
+        ignore: /.*/
+      branches:
+        only: /^release\/.*\.0$/
+
+commands:
+  install-and-create-sim:
+    parameters:
+      install-name:
+        type: string
+      sim-device-type:
+        type: string
+      sim-device-runtime:
+        type: string
+      sim-name:
+        type: string
+    steps:
+      - run:
+          name: Install xcode-install
+          command: gem install xcode-install
+      - run:
+          name: Install simulator
+          command: | # Print all available simulators and install required one
+              xcversion simulators
+              xcversion simulators --install="<< parameters.install-name >>"
+      - run:
+          name: Create simulator
+          command: xcrun simctl create '<< parameters.sim-name >>' com.apple.CoreSimulator.SimDeviceType.<< parameters.sim-device-type >> com.apple.CoreSimulator.SimRuntime.<< parameters.sim-device-runtime >>
+
+  install-bundle-dependencies:
+    parameters:
+      directory:
+        type: string
+        default: .
+    steps:
+      - restore_cache:
+          keys:
+            - v2-gem-cache-{{ checksum "Gemfile.lock" }}
+      - run:
+          name: Bundle install
+          working_directory: << parameters.directory >>
+          command: |
+              bundle config set --local clean 'true'
+              bundle config set --local path 'vendor/bundle'
+              bundle install
+      - save_cache:
+          key: v2-gem-cache-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+  
+  install-dependencies:
+    parameters:
+      directory:
+        type: string
+        default: .
+    steps:
+      - install-bundle-dependencies:
+          directory: << parameters.directory >>
+      - restore_cache:
+          keys:
+            - homebrew-cache-{{ checksum "Brewfile.lock.json" }}
+      - install-brew-dependency:
+          dependency_name: 'xcbeautify'
+      - install-brew-dependency:
+          dependency_name: 'swiftlint'
+      - save_cache:
+          key: homebrew-cache-{{ checksum "Brewfile.lock.json" }}
+          paths:
+            - /usr/local/Cellar/swiftlint/
+            - /usr/local/Cellar/xcbeautify/
+            - /Users/$USER/Library/Caches/Homebrew/
+  
+  install-brew-dependency:
+    parameters:
+      dependency_name:
+        type: string
+    steps:
+      - run:
+          name: Install << parameters.dependency_name >>
+          command: |
+            # Link dependency in case it was found in the cache
+            brew link << parameters.dependency_name >> || true
+
+            if which << parameters.dependency_name >> > /dev/null 2>&1; then
+                echo "Skipping installation, already found."
+                exit 0;
+            fi
+            brew install << parameters.dependency_name >>
+          environment:
+            HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+  install-rubydocker-dependencies:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-rubydocker-gem-cache-{{ checksum "Gemfile.lock" }}
+      - run:
+          name: Bundle install
+          command: bundle install --clean --path vendor/bundle
+      - save_cache:
+          key: v1-rubydocker-gem-cache-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+  compress_result_bundle:
+    parameters:
+      directory:
+        type: string
+      bundle_name:
+        type: string
+    steps:
+      - run:
+          name: Compress result bundle
+          command: |
+             tar -czf << parameters.bundle_name >>.xcresult.tar.gz << parameters.bundle_name >>.xcresult && \
+             rm -r << parameters.bundle_name >>.xcresult
+          working_directory: << parameters.directory >>
+          when: always
+
+  scan:
+    parameters:
+      directory:
+        type: string
+    steps:
+      - run:
+          name: Replace API key
+          command: bundle exec fastlane replace_api_key_integration_tests
+      - run:
+          name: Run tests
+          working_directory: << parameters.directory >>
+          command: bundle exec fastlane scan
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/report.html
+          destination: test_report.html
+
+  scan-and-archive:
+    parameters:
+      directory:
+        type: string
+    steps:
+      - run:
+          name: Replace API key
+          command: bundle exec fastlane replace_api_key_integration_tests
+      - run:
+          name: Run tests
+          working_directory: << parameters.directory >>
+          command: bundle exec fastlane scan
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/report.html
+          destination: test_report.html
+      - run:
+          name: Archive
+          working_directory: << parameters.directory >>
+          command: |
+              bundle exec fastlane archive
+
+  scan-and-archive-all-platforms:
+    parameters:
+      directory:
+        type: string
+    steps:
+      - run:
+          name: Replace API key
+          command: bundle exec fastlane replace_api_key_integration_tests
+      - run:
+          name: Run tests
+          working_directory: << parameters.directory >>
+          command: bundle exec fastlane scan
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/report.html
+          destination: test_report.html
+      - run:
+          name: Archive all platforms
+          working_directory: << parameters.directory >>
+          command: |
+              bundle exec fastlane archive_all_platforms
+
+  install-dependencies-scan-and-archive:
+    parameters:
+      directory:
+        type: string
+    steps:
+      - install-dependencies:
+          directory: << parameters.directory >>
+      - scan-and-archive:
+          directory: << parameters.directory >>
+
+  setup-git-credentials:
+     steps:
+       - run:
+           name: Setup Git config
+           command: |
+             git config --global user.email $GIT_EMAIL
+             git config --global user.name $GIT_USERNAME
+
+  trust-github-key:
+    steps:
+      - run:
+          name: Trust GitHub key
+          command: |
+              for ip in $(dig @8.8.8.8 github.com +short); \
+              do ssh-keyscan github.com,$ip; \
+              ssh-keyscan $ip; \
+              done 2>/dev/null >> ~/.ssh/known_hosts
+
+  update-spm-installation-commit:
+    steps:
+      - install-dependencies
+      - run:
+          name: Update git commit in targets that use SPM for dependencies
+          command: |
+              bundle exec fastlane update_swift_package_commit
+
+  update-carthage-installation-commit:
+    steps:
+      - install-dependencies
+      - run:
+          name: Update git commit in Carthage Installation tests
+          working_directory: Tests/InstallationTests/CarthageInstallation/
+          command: |
+              bundle exec fastlane update_carthage_commit
+
+jobs:
+  spm-release-build-xcode-14:
+    <<: *base-job
+    steps:
+      - checkout
+      - run:
+          name: SPM Release Build
+          command: swift build -c release --target RevenueCat
+          no_output_timeout: 30m
+
+  spm-release-build-xcode-15:
+    <<: *base-job
+    steps:
+      - checkout
+      - run:
+          name: SPM Release Build
+          command: swift build -c release --target RevenueCat
+          no_output_timeout: 30m
+
+  spm-custom-entitlement-computation-build:
+    <<: *base-job
+    steps:
+      - checkout
+      - run:
+          name: SPM Custom Entitlement Computation Build
+          command: swift build --target RevenueCat_CustomEntitlementComputation
+          no_output_timeout: 30m
+      - update-spm-installation-commit
+      - run:
+          name: Custom Entitlement Computation API Tests
+          command: bundle exec fastlane build_custom_entitlement_computation_api_tester
+
+  spm-receipt-parser:
+    <<: *base-job
+    steps:
+      - checkout
+      - run:
+          name: SPM Receipt Parser
+          command: swift build -c release --target ReceiptParser
+          no_output_timeout: 30m
+  
+  spm-xcode-14-1:
+    <<: *base-job
+    steps:
+      - checkout
+      - run:
+          name: SPM Release Build
+          command: swift build -c release --target RevenueCat
+          no_output_timeout: 30m
+
+  run-test-ios-17:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_ios
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 14 (17.0)
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: RevenueCat
+      - when:
+          condition: << pipeline.parameters.generate_snapshots >>
+          steps:
+            - run:
+                name: Run create_snapshot_pr 
+                command: bundle exec fastlane create_snapshot_pr version:"ios-17"
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  run-test-ios-16:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_ios
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 14 (16.4)
+      - codecov/upload:
+          xtra_args: "-v --xc --xp fastlane/test_output/xctest/ios/RevenueCat.xcresult"
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: RevenueCat
+      - when:
+          condition: << pipeline.parameters.generate_snapshots >>
+          steps:
+            - run:
+                name: Run create_snapshot_pr 
+                command: bundle exec fastlane create_snapshot_pr version:"ios-16"
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  run-test-ios-15:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_ios
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 13 (15.5)
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: RevenueCat
+      - when:
+          condition: << pipeline.parameters.generate_snapshots >>
+          steps:
+            - run:
+                name: Run create_snapshot_pr 
+                command: bundle exec fastlane create_snapshot_pr version:"ios-15"
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  run-test-tvos:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_tvos
+          no_output_timeout: 5m
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/tvos
+          bundle_name: RevenueCat
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  run-test-watchos:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_watchos
+          no_output_timeout: 5m
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/watchos
+          bundle_name: RevenueCat
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  run-test-ios-14:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_ios
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 8 (14.5)
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: RevenueCat
+      - when:
+          condition: << pipeline.parameters.generate_snapshots >>
+          steps:
+            - run:
+                name: Run create_snapshot_pr 
+                command: bundle exec fastlane create_snapshot_pr version:"ios-14"
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  run-test-ios-13:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - install-and-create-sim:
+          install-name: iOS 13.7 Simulator
+          sim-device-type: iPhone-8
+          sim-device-runtime: iOS-13-7
+          sim-name: iPhone 8 (13.7)
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_ios
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 8 (13.7)
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: RevenueCat
+      - when:
+          condition: << pipeline.parameters.generate_snapshots >>
+          steps:
+            - run:
+                name: Run create_snapshot_pr 
+                command: bundle exec fastlane create_snapshot_pr version:"ios-13"
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  run-test-ios-12:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - install-and-create-sim:
+          install-name: iOS 12.4 Simulator
+          sim-device-type: iPhone-6
+          sim-device-runtime: iOS-12-4
+          sim-name: iPhone 6 (12.4)
+      - run:
+          name: Run tests
+          command: bundle exec fastlane test_ios
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 6 (12.4)
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: RevenueCat
+      - when:
+          condition: << pipeline.parameters.generate_snapshots >>
+          steps:
+            - run:
+                name: Run create_snapshot_pr 
+                command: bundle exec fastlane create_snapshot_pr version:"ios-12"
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  build-tv-watch-and-macos:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Build tvOS, watchOS and macOS
+          command: bundle exec fastlane build_tv_watch_mac
+          no_output_timeout: 30m
+
+  build-visionos:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          name: Build visionOS
+          command: bundle exec fastlane build_visionos
+          no_output_timeout: 30m
+
+  backend-integration-tests:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - update-spm-installation-commit
+      - run:
+          name: Run backend_integration Tests
+          command: bundle exec fastlane backend_integration_tests
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 14 (16.4)
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: BackendIntegrationTests
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+
+  release-checks:
+    <<: *base-job
+    steps:
+      - checkout
+      - trust-github-key
+      # Bundler
+      - restore_cache:
+          keys:
+            - v2-gem-cache-{{ checksum "Gemfile.lock" }}
+      - run: bundle install --clean --path vendor/bundle
+      - save_cache:
+          key: v2-gem-cache-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+      - update-spm-installation-commit
+      - run:
+          name: Deployment checks
+          command: bundle exec fastlane release_checks
+          environment:
+            SCAN_SCHEME: All Tests
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/report.html
+          destination: test_report.html
+
+  docs-deploy:
+    <<: *base-job
+    steps:
+      - setup-git-credentials
+      - checkout
+      - install-bundle-dependencies
+      - run:
+          name: Build docs
+          command: bundle exec fastlane generate_docs
+          environment:
+            DOCS_IOS_VERSION: "16.1"
+
+  make-release:
+    <<: *base-job
+    steps:
+      - checkout
+      - trust-github-key
+      - update-spm-installation-commit
+      - run:
+          name: Deploy new version
+          command: bundle exec fastlane release
+          no_output_timeout: 30m
+
+  push-pods:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-bundle-dependencies
+      - trust-github-key
+      - run:
+          name: Deploy new version
+          command: bundle exec fastlane push_pods
+          no_output_timeout: 30m
+
+  prepare-next-version:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - trust-github-key
+      - run:
+          name: Prepare next version
+          command: bundle exec fastlane prepare_next_version
+
+  installation-tests-cocoapods:
+    <<: *base-job
+    steps:
+      - checkout
+      - install-dependencies
+      - install-dependencies:
+          directory: Tests/InstallationTests/CocoapodsInstallation
+      - run:
+          name: Install Pods
+          working_directory: Tests/InstallationTests/CocoapodsInstallation/
+          command: |
+              bundle exec pod install
+      - scan-and-archive:
+          directory: Tests/InstallationTests/CocoapodsInstallation
+
+  installation-tests-swift-package-manager:
+    <<: *base-job
+    steps:
+      - checkout
+      - trust-github-key
+      - update-spm-installation-commit
+      - install-dependencies:
+          directory: Tests/InstallationTests/SPMInstallation/
+      - scan-and-archive-all-platforms:
+          directory: Tests/InstallationTests/SPMInstallation/
+
+  installation-tests-custom-entitlement-computation-swift-package-manager:
+    <<: *base-job
+    steps:
+      - checkout
+      - trust-github-key
+      - update-spm-installation-commit
+      - install-dependencies:
+          directory: Tests/InstallationTests/SPMCustomEntitlementComputationInstallation/
+      - scan:
+          directory: Tests/InstallationTests/SPMCustomEntitlementComputationInstallation/
+
+  installation-tests-receipt-parser:
+    <<: *base-job
+    steps:
+      - checkout
+      - trust-github-key
+      - update-spm-installation-commit
+      - install-dependencies:
+          directory: Tests/InstallationTests/ReceiptParserInstallation/
+      - scan-and-archive-all-platforms:
+          directory: Tests/InstallationTests/ReceiptParserInstallation/
+
+  installation-tests-carthage:
+    <<: *base-job
+    steps:
+      - checkout
+      - trust-github-key
+      - update-carthage-installation-commit
+      # Carthage
+      - run:
+          name: Carthage Update
+          working_directory: Tests/InstallationTests/CarthageInstallation/
+          # install without building, then remove the tests and build, so that carthage
+          # doesn't try to build the other installation tests
+          command: |
+              carthage update --no-build
+              rm -rf Carthage/Checkouts/purchases-root/Tests/InstallationTests/
+              carthage build --use-xcframeworks --verbose
+
+      - install-dependencies-scan-and-archive:
+          directory: Tests/InstallationTests/CarthageInstallation/
+
+  installation-tests-xcode-direct-integration:
+    <<: *base-job
+    working_directory: ~/purchases-ios/
+    shell: /bin/bash --login -o pipefail
+    steps:
+      - checkout
+
+      - install-dependencies-scan-and-archive:
+          directory: Tests/InstallationTests/XcodeDirectInstallation/
+
+  lint:
+    <<: *base-job
+    working_directory: ~/purchases-ios/
+    shell: /bin/bash --login -o pipefail
+    steps:
+      - checkout
+      - install-dependencies
+      - run:
+          command: mkdir -p fastlane/test_output/swiftlint
+      - run:
+          name: Run fastlane swiftlint lane
+          command: |
+            bundle exec fastlane run swiftlint raise_if_swiftlint_error:true strict:true \
+            reporter:junit output_file:fastlane/test_output/swiftlint/junit.xml
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output
+
+  danger:
+    docker:
+      - image: cimg/ruby:3.1.2
+    working_directory: ~/purchases-ios
+    shell: /bin/bash --login -o pipefail
+    steps:
+      - checkout
+      - install-rubydocker-dependencies
+      - run:
+          name: Run Danger
+          command: bundle exec danger --verbose
+
+  tag-release-branch:
+    docker:
+      - image: cimg/ruby:3.1.2
+    working_directory: ~/purchases-ios
+    shell: /bin/bash --login -o pipefail
+    steps:
+      - checkout
+      - setup-git-credentials
+      - trust-github-key
+      - install-rubydocker-dependencies
+      - run:
+          name: Tag branch
+          command: bundle exec fastlane tag_current_branch
+
+  release-train:
+    <<: *base-job
+    steps:
+      - checkout
+      - setup-git-credentials
+      - trust-github-key
+      - install-dependencies
+      - run:
+          name: Create automatic PR
+          command: bundle exec fastlane automatic_bump github_rate_limit:10
+
+  loadshedder-integration-tests:
+    <<: *base-job
+    steps:
+      - checkout
+      - setup-git-credentials
+      - trust-github-key
+      - install-dependencies
+      - update-spm-installation-commit
+      - run:
+          name: V3 LoadShedder integration tests
+          command: bundle exec fastlane v3_loadshedder_integration_tests
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: v3LoadShedderIntegration
+      - run:
+          name: Backend and LoadShedder integration tests
+          command: bundle exec fastlane backend_integration_tests
+          no_output_timeout: 5m
+          environment:
+            SCAN_DEVICE: iPhone 14 (16.4)
+      - compress_result_bundle:
+          directory: fastlane/test_output/xctest/ios
+          bundle_name: BackendIntegrationTests
+      - store_test_results:
+          path: fastlane/test_output
+      - store_artifacts:
+          path: fastlane/test_output/xctest
+          destination: scan-test-output
+  
+  deploy-purchase-tester:
+    <<: *base-job
+    steps:
+      - checkout
+      - setup-git-credentials
+      - trust-github-key
+      - install-dependencies
+      - update-spm-installation-commit
+      - run:
+          name: Submit Purchase Tester
+          working_directory: "Tests/TestingApps/PurchaseTesterSwiftUI"
+          command: bundle exec fastlane deploy_purchase_tester
+
+  notify-on-non-patch-release-branches:
+    docker:
+      - image: 'cimg/base:stable'
+    steps:
+      - slack/notify:
+          custom: |
+              {
+                "text": "Public facing changes detected",
+                "blocks": [
+                  {
+                    "type": "header",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "REMINDER :raised_hand:",
+                      "emoji": true
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "Do *public docs* need to be updated?"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "Does the *SDK parity spreadsheet* need to be updated?"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Project*: $CIRCLE_PROJECT_REPONAME"
+                      },
+                      {
+                        "type": "mrkdwn",
+                        "text": "*Branch*: $CIRCLE_BRANCH"
+                      }
+                    ]
+                  }
+                ]
+              }
+
+workflows:
+  version: 2
+  generate-snapshot:
+    when: << pipeline.parameters.generate_snapshots >>
+    jobs:
+      # Disabled until we drop support for iOS 11
+      # - run-test-ios-17:
+      #     xcode_version: '15.0.0'
+      - run-test-ios-16:
+          xcode_version: '14.3.0'
+      - run-test-ios-15:
+          xcode_version: '14.3.0'
+      - run-test-ios-14:
+          # Simulator fails to install on Xcode 14
+          xcode_version: '13.4.1'
+      - run-test-ios-13:
+          # Simulator fails to install on Xcode 14
+          xcode_version: '13.4.1'
+      - run-test-ios-12:
+          # Simulator fails to install on Xcode 14
+          xcode_version: '13.4.1'
+  build-test:
+    when:
+      and:
+        - not:
+            equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+        - not: << pipeline.parameters.generate_snapshots >>
+    jobs:
+      - lint:
+          xcode_version: '14.3.0'
+      - spm-release-build-xcode-14:
+          xcode_version: '14.3.0'
+      - spm-release-build-xcode-15:
+          xcode_version: '15.0.0'
+      - spm-xcode-14-1:
+          xcode_version: '14.1.0'
+      - spm-custom-entitlement-computation-build:
+          xcode_version: '14.3.0'
+      - spm-receipt-parser:
+          xcode_version: '14.3.0'
+      # Disabled until we drop support for iOS 11
+      # - run-test-ios-17:
+      #     xcode_version: '15.0.0'
+      - run-test-ios-16:
+          xcode_version: '14.3.0'
+      - run-test-ios-15:
+          xcode_version: '14.3.0'
+      - run-test-watchos:
+          xcode_version: '14.3.0'
+      - run-test-tvos:
+          xcode_version: '14.3.0'
+      - run-test-ios-14:
+          # Simulator fails to install on Xcode 14
+          xcode_version: '13.4.1'
+      - run-test-ios-13:
+          # Simulator fails to install on Xcode 14
+          xcode_version: '13.4.1'
+          <<: *release-branches-and-main
+      - run-test-ios-12:
+          # Simulator fails to install on Xcode 14
+          xcode_version: '13.4.1'
+          <<: *release-branches-and-main
+      - build-tv-watch-and-macos:
+          xcode_version: '14.3.0'
+      - build-visionos:
+          xcode_version: '15.0.0'
+      - backend-integration-tests:
+          xcode_version: '14.3.0'
+          filters:
+              branches:
+                # Forked pull requests have CIRCLE_BRANCH set to pull/XXX
+                ignore: /pull\/[0-9]+/
+  deploy:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - release-checks:
+          xcode_version: '14.3.0'
+          <<: *release-branches
+      - installation-tests-cocoapods:
+          xcode_version: '14.3.0'
+          <<: *release-branches
+      - installation-tests-swift-package-manager:
+          xcode_version: '14.3.0'
+          <<: *release-branches
+      - installation-tests-custom-entitlement-computation-swift-package-manager:
+          xcode_version: '14.3.0'
+          <<: *release-branches
+      - installation-tests-receipt-parser:
+          xcode_version: '14.1.0'
+          <<: *release-branches
+      - installation-tests-carthage:
+          xcode_version: '14.3.0'
+          <<: *release-branches
+      - installation-tests-xcode-direct-integration:
+          xcode_version: '14.3.0'
+          <<: *release-branches
+      - hold:
+          type: approval
+          requires:
+            - release-checks
+            - installation-tests-cocoapods
+            - installation-tests-swift-package-manager
+            - installation-tests-custom-entitlement-computation-swift-package-manager
+            - installation-tests-carthage
+            - installation-tests-xcode-direct-integration
+            - installation-tests-receipt-parser
+          <<: *release-branches
+      - tag-release-branch:
+          requires:
+            - hold
+          <<: *release-branches
+      - make-release:
+          xcode_version: '14.3.0'
+          <<: *release-tags
+      - push-pods:
+          # Xcode 14 not supported until https://github.com/CocoaPods/CocoaPods/issues/11558 is fixed.
+          # This runs as its own job until https://github.com/CocoaPods/CocoaPods/issues/11621 is fixed.
+          xcode_version: '13.4.1'
+          requires:
+            - make-release
+          <<: *release-tags
+      - docs-deploy:
+          xcode_version: '14.3.0'
+          <<: *release-tags
+      - deploy-purchase-tester:
+          xcode_version: '14.3.0'
+          <<: *release-tags
+      - notify-on-non-patch-release-branches:
+          requires:
+            - make-release
+          <<: *non-patch-release-branches
+          context: slack-secrets
+  snapshot-bump:
+    when:
+      not:
+        equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+    jobs:
+      - prepare-next-version:
+          xcode_version: '14.3.0'
+          <<: *only-main-branch
+  danger:
+    jobs:
+      - danger
+  weekly-run-workflow:
+    when:
+      and:
+        - equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+        - equal: [ "release-train", << pipeline.schedule.name >> ]
+    jobs:
+      - release-train:
+          xcode_version: '14.3.0'
+
+  daily-loadshedder-integration-tests:
+    when:
+      and:
+        - equal: [ scheduled_pipeline, << pipeline.trigger_source >> ]
+        - equal: [ "load_shedder_integration_tests", << pipeline.schedule.name >> ]
+    jobs:
+      - loadshedder-integration-tests:
+          xcode_version: '14.3.0'
+  
+  manual-trigger-bump:
+    when:
+      equal: [ bump, << pipeline.parameters.action >> ]
+    jobs:
+      - release-train:
+          xcode_version: '14.3.0'

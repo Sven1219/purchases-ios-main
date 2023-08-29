@@ -1,0 +1,32 @@
+{
+  "current_offering_id" : "default",
+  "offerings" : [
+    {
+      "description" : "standard set of packages",
+      "identifier" : "default",
+      "metadata" : {
+        "dontdeletethis" : "useforintegrationtesting",
+        "meta" : "data"
+      },
+      "packages" : [
+        {
+          "identifier" : "$rc_monthly",
+          "platform_product_identifier" : "com.revenuecat.loadShedder.monthly"
+        }
+      ]
+    },
+    {
+      "description" : "an alternative offering",
+      "identifier" : "alternative offering",
+      "metadata" : {
+
+      },
+      "packages" : [
+        {
+          "identifier" : "$rc_monthly",
+          "platform_product_identifier" : "com.revenuecat.loadShedder.monthly"
+        }
+      ]
+    }
+  ]
+}
